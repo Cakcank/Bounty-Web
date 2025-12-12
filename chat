@@ -1,0 +1,207 @@
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+header("Content-Type: application/json");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+require_once "../db.php";
+
+$user_id = $_GET['user_id'] ?? null;
+if (!$user_id) {
+    echo json_encode([]);
+    exit;
+}
+
+$query = "
+SELECT 
+    c.id AS convo_id,
+    c.user_a,
+    c.user_b,
+    IF(c.user_a = ?, u2.username, u1.username) AS other_username,
+    m.message AS last_message,
+    m.created_at AS last_message_at
+FROM conversations c
+LEFT JOIN users u1 ON u1.id = c.user_a
+LEFT JOIN users u2 ON u2.id = c.user_b
+LEFT JOIN (
+    SELECT mm1.*
+    FROM messages mm1
+    JOIN (
+        SELECT conversation_id, MAX(created_at) AS last_time
+        FROM messages
+        GROUP BY conversation_id
+    ) mm2 ON mm1.conversation_id = mm2.conversation_id 
+          AND mm1.created_at = mm2.last_time
+) m ON m.conversation_id = c.id
+WHERE c.user_a = ? OR c.user_b = ?
+ORDER BY m.created_at DESC;
+";
+
+$stmt = $conn->prepare($query);
+
+if (!$stmt) {
+    echo json_encode(["sql_error" => $conn->error]);
+    exit;
+}
+
+$stmt->bind_param("iii", $user_id, $user_id, $user_id);
+
+if (!$stmt->execute()) {
+    echo json_encode(["exec_error" => $stmt->error]);
+    exit;
+}
+
+$res = $stmt->get_result();
+$data = $res->fetch_all(MYSQLI_ASSOC);
+
+echo json_encode($data);
+
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+// Handle preflight CORS
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+require_once "../db.php";
+
+$convo_id = $_GET['conversation_id'] ?? null;
+if (!$convo_id) { 
+    http_response_code(400); 
+    echo json_encode(["error" => "conversation_id required"]);
+    exit;
+}
+
+// Query dengan JOIN ke tabel users untuk ambil nama pengirim
+$query = "
+    SELECT 
+        m.id,
+        m.conversation_id,
+        m.sender_id,
+        u.username AS sender_name,
+        m.message,
+        m.created_at
+    FROM messages m
+    LEFT JOIN users u ON m.sender_id = u.id
+    WHERE m.conversation_id = ?
+    ORDER BY m.created_at ASC
+";
+
+$stmt = $conn->prepare($query);
+$stmt->bind_param("i", $convo_id);
+$stmt->execute();
+$res = $stmt->get_result();
+
+// Kembalikan hasil dalam bentuk JSON
+echo json_encode($res->fetch_all(MYSQLI_ASSOC));
+
+$stmt->close();
+
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+require_once "../db.php";
+$input = json_decode(file_get_contents("php://input"), true);
+
+$from = $input['from'] ?? null;
+$to = $input['to'] ?? null;
+$message = $input['message'] ?? null;
+
+if (!$from || !$to || !$message) { 
+    http_response_code(400); 
+    echo json_encode(["error"=>"missing fields"]); 
+    exit; 
+}
+
+if ($from == $to) {
+    http_response_code(400);
+    echo json_encode(["error" => "Tidak bisa mengirim pesan ke diri sendiri"]);
+    exit();
+}
+
+$low  = min($from, $to);
+$high = max($from, $to);
+
+$stmt = $conn->prepare("SELECT id FROM conversations WHERE user_low = ? AND user_high = ? LIMIT 1");
+$stmt->bind_param("ii", $low, $high);
+$stmt->execute();
+$res = $stmt->get_result();
+$row = $res->fetch_assoc();
+$stmt->close();
+
+if ($row) {
+    $convo_id = $row['id'];
+} else {
+    $stmt = $conn->prepare("
+        INSERT INTO conversations (user_a, user_b, user_low, user_high, created_at) 
+        VALUES (?, ?, ?, ?, NOW())
+    ");
+    $stmt->bind_param("iiii", $from, $to, $low, $high);
+    $stmt->execute();
+    $convo_id = $stmt->insert_id;
+    $stmt->close();
+}
+
+$stmt = $conn->prepare("
+    INSERT INTO messages (conversation_id, sender_id, message, created_at) 
+    VALUES (?, ?, ?, NOW())
+");
+$stmt->bind_param("iis", $convo_id, $from, $message);
+$stmt->execute();
+$msg_id = $stmt->insert_id;
+$stmt->close();
+
+echo json_encode(["status"=>"sent", "conversation_id"=>$convo_id, "message_id"=>$msg_id]);
+
+<?php
+require_once "../db.php";
+
+$user_a = intval($_POST['user_a'] ?? 0);
+$user_b = intval($_POST['user_b'] ?? 0);
+
+if (!$user_a || !$user_b) {
+    echo json_encode(["success" => false, "error" => "Missing user IDs"]);
+    exit;
+}
+
+// Cari conversation existing (tanpa urutan)
+$stmt = $conn->prepare("
+    SELECT id FROM conversations 
+    WHERE (user_a = LEAST(?, ?) AND user_b = GREATEST(?, ?))
+          OR (user_a = GREATEST(?, ?) AND user_b = LEAST(?, ?))
+    LIMIT 1
+");
+$stmt->bind_param("iiiiiiii", $user_a, $user_b, $user_a, $user_b, $user_a, $user_b, $user_a, $user_b);
+$stmt->execute();
+$result = $stmt->get_result();
+
+if ($row = $result->fetch_assoc()) {
+    echo json_encode(["success" => true, "conversation_id" => $row['id']]);
+    exit;
+}
+
+// Kalau belum ada → buat baru
+$stmt = $conn->prepare("
+    INSERT INTO conversations (user_a, user_b) 
+    VALUES (LEAST(?, ?), GREATEST(?, ?))
+");
+$stmt->bind_param("iiii", $user_a, $user_b, $user_a, $user_b);
+$stmt->execute();
+
+echo json_encode(["success" => true, "conversation_id" => $stmt->insert_id]);
